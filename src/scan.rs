@@ -374,7 +374,10 @@ fn handle_lockers(specs: &[Spec]) -> Vec<Locker> {
         if file_type_index.is_some_and(|idx| entry.object_type_index != idx) {
             continue;
         }
-        if let Some(cached) = obj_names.get(&(entry.object as usize)) {
+        // 未提权时 (Win11 24H2+ 无 SeDebugPrivilege) 内核对象指针全被抹成 0, 不能当缓存键,
+        // 否则第一个句柄的查名结果会套到所有句柄上。为 0 时不读不写缓存, 逐个查名
+        let obj = entry.object as usize;
+        if let Some(cached) = obj_names.get(&obj).filter(|_| obj != 0) {
             if let Some(name) = cached {
                 record(name, entry, pid, &mut lockers);
             }
@@ -412,14 +415,18 @@ fn handle_lockers(specs: &[Spec]) -> Vec<Locker> {
                 if let Some(n) = &name {
                     record(n, entry, pid, &mut lockers);
                 }
-                obj_names.insert(entry.object as usize, name);
+                if obj != 0 {
+                    obj_names.insert(obj, name);
+                }
                 unsafe {
                     let _ = CloseHandle(dup);
                 }
             }
             QueryResult::TimedOut => {
                 // 卡死: 记成无名 (同对象别再卡一次), 弃 dup (旧 worker 可能还在用它), 换新 worker
-                obj_names.insert(entry.object as usize, None);
+                if obj != 0 {
+                    obj_names.insert(obj, None);
+                }
                 querier = NameQuerier::new();
             }
         }
