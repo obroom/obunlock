@@ -241,7 +241,8 @@ pub fn find_lockers(targets: &[PathBuf]) -> Vec<Locker> {
 
     let specs = &specs;
     let targets = &targets;
-    let (mut lockers, t_handles, t_images) = std::thread::scope(|sc| {
+    // 四路同时跑 (第 4 路在本线程), 总耗时 ≈ 最慢的那路
+    let (mut lockers, [t_handles, t_images, t_in_use, t_rm]) = std::thread::scope(|sc| {
         let timed = |f: fn(&[Spec]) -> Vec<Locker>| {
             move || {
                 let t = Instant::now();
@@ -250,13 +251,20 @@ pub fn find_lockers(targets: &[PathBuf]) -> Vec<Locker> {
         };
         let handles = sc.spawn(timed(handle_lockers));
         let images = sc.spawn(timed(image_lockers));
-        let mut out = in_use_lockers(targets);
-        out.extend(restart_manager_lockers(targets));
+        let in_use = sc.spawn(|| {
+            let t = Instant::now();
+            (in_use_lockers(targets), t.elapsed())
+        });
+        let t = Instant::now();
+        let mut out = restart_manager_lockers(targets);
+        let tr = t.elapsed();
+        let (u, tu) = in_use.join().unwrap_or_default();
         let (h, th) = handles.join().unwrap_or_default();
         let (i, ti) = images.join().unwrap_or_default();
+        out.extend(u);
         out.extend(h);
         out.extend(i);
-        (out, th, ti)
+        (out, [th, ti, tu, tr])
     });
 
     let strong: std::collections::HashSet<(u32, usize)> =
@@ -268,12 +276,14 @@ pub fn find_lockers(targets: &[PathBuf]) -> Vec<Locker> {
         log::info!("unlock: target#{} locked by {} (pid {}, {:?}, handle {:#x})", l.target, l.name, l.pid, l.kind, l.handle);
     }
     log::info!(
-        "unlock: scan done, {} targets, {} records ({}ms: handles {}ms, images {}ms)",
+        "unlock: scan done, {} targets, {} records ({}ms: handles {}ms, images {}ms, in-use {}ms, rm {}ms)",
         targets.len(),
         lockers.len(),
         t0.elapsed().as_millis(),
         t_handles.as_millis(),
         t_images.as_millis(),
+        t_in_use.as_millis(),
+        t_rm.as_millis(),
     );
     lockers
 }
@@ -551,44 +561,57 @@ fn in_use_lockers(targets: &[(PathBuf, bool)]) -> Vec<Locker> {
     };
     let our_pid = unsafe { GetCurrentProcessId() };
     let deadline = Instant::now() + IN_USE_BUDGET;
-    let mut info = ProcInfoCache::default();
-    let mut found: std::collections::HashSet<(u32, usize)> = std::collections::HashSet::new();
-    let mut lockers = Vec::new();
-    let mut entries = 0usize;
-    let mut ask = |p: &Path, idx: usize, lockers: &mut Vec<Locker>| {
-        for pid in pids_using(nt_qif, p) {
-            if pid != our_pid && pid != 0 && found.insert((pid, idx)) {
-                lockers.push(info.locker(pid, 0, idx, LockKind::InUse, ""));
-            }
-        }
-    };
-
+    // 先列出要问的 (路径, 第几个目标, 是不是选中项本身), 文件夹往里走; 再分给几个线程问 ——
+    // 系统每问一个文件要 ~40ms (实测, 跟打开文件无关), 串行问 40 个就是一秒多
+    let mut ask: Vec<(PathBuf, usize, bool)> = Vec::new();
     for (idx, (root, is_dir)) in targets.iter().enumerate() {
         let mut stack = vec![root.clone()];
         while let Some(p) = stack.pop() {
-            entries += 1;
-            ask(&p, idx, &mut lockers);
-            if !*is_dir || entries >= IN_USE_MAX_ENTRIES || Instant::now() >= deadline {
-                continue;
-            }
-            let Ok(rd) = std::fs::read_dir(&p) else { continue };
-            for e in rd.flatten() {
-                match e.file_type() {
-                    Ok(ft) if ft.is_symlink() => {} // 联接点 / 链接指向的东西不在这个文件夹里
-                    Ok(ft) if ft.is_dir() => stack.push(e.path()),
-                    Ok(_) => {
-                        entries += 1;
-                        ask(&e.path(), idx, &mut lockers);
+            if *is_dir && ask.len() < IN_USE_MAX_ENTRIES && Instant::now() < deadline {
+                for e in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+                    match e.file_type() {
+                        Ok(ft) if ft.is_symlink() => {} // 联接点 / 链接指向的东西不在这个文件夹里
+                        Ok(ft) if ft.is_dir() => stack.push(e.path()),
+                        Ok(_) => ask.push((e.path(), idx, false)),
+                        Err(_) => {}
                     }
-                    Err(_) => {}
                 }
             }
+            let is_root = &p == root;
+            ask.push((p, idx, is_root));
         }
     }
-    if entries >= IN_USE_MAX_ENTRIES || Instant::now() >= deadline {
-        log::info!("unlock: in-use walk stopped early after {entries} entries");
+    let hits = par_flat_map(&ask, |(p, idx, root)| {
+        // 选中项本身一定问; 文件夹里面的到点就不问了
+        if !root && Instant::now() >= deadline {
+            return Vec::new();
+        }
+        pids_using(nt_qif, p).into_iter().filter(|&pid| pid != our_pid && pid != 0).map(|pid| (pid, *idx)).collect()
+    });
+    if ask.len() >= IN_USE_MAX_ENTRIES || Instant::now() >= deadline {
+        log::info!("unlock: in-use walk stopped early after {} entries", ask.len());
     }
-    lockers
+    let mut info = ProcInfoCache::default();
+    let mut found = std::collections::HashSet::new();
+    hits.into_iter().filter(|&h| found.insert(h)).map(|(pid, idx)| info.locker(pid, 0, idx, LockKind::InUse, "")).collect()
+}
+
+/// 并行问系统用的线程数。in_use / RM 每个文件几十到上百毫秒, 实测 40 个文件 8 线程: in_use 1.6s → 0.24s, RM 5.8s → 0.88s
+const PAR_THREADS: usize = 8;
+
+/// 把 items 平均分给最多 PAR_THREADS 个线程, 各自 f 出一串结果, 合起来 (结果自带归属, 不管顺序)
+fn par_flat_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> Vec<R> + Sync) -> Vec<R> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let f = &f;
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = items
+            .chunks(items.len().div_ceil(PAR_THREADS))
+            .map(|c| sc.spawn(move || c.iter().flat_map(f).collect::<Vec<R>>()))
+            .collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    })
 }
 
 /// 开着 `p` 的进程 pid (含本进程自己 —— 查询时我们也开着它)。
@@ -627,7 +650,7 @@ fn pids_using(nt_qif: NtQueryInformationFileFn, p: &Path) -> Vec<u32> {
 // ── 第 4 路: Restart Manager ───────────────────────────────────
 
 /// 只对文件做 (目录不能被加载为模块, RM 也不递归)。每个文件单独一个会话 —— RmGetList 不区分
-/// 命中的是哪个资源, 合在一起就没法按文件归属。
+/// 命中的是哪个资源, 合在一起就没法按文件归属。被占的文件一个会话 ~135ms, 所以各会话分给几个线程同时跑。
 fn restart_manager_lockers(targets: &[(PathBuf, bool)]) -> Vec<Locker> {
     use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
     use windows::Win32::System::RestartManager::{
@@ -636,16 +659,14 @@ fn restart_manager_lockers(targets: &[(PathBuf, bool)]) -> Vec<Locker> {
     use windows::core::PWSTR;
 
     let our_pid = unsafe { GetCurrentProcessId() };
-    let mut lockers = Vec::new();
-    for (idx, (path, is_dir)) in targets.iter().enumerate() {
-        if *is_dir {
-            continue;
-        }
+    let files: Vec<(usize, &PathBuf)> = targets.iter().enumerate().filter(|(_, (_, d))| !d).map(|(i, (p, _))| (i, p)).collect();
+    par_flat_map(&files, |&(idx, path)| {
+        let mut lockers = Vec::new();
         let path_w: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         let mut session: u32 = 0;
         let mut key = [0u16; (CCH_RM_SESSION_KEY + 1) as usize];
         if unsafe { RmStartSession(&mut session, None, PWSTR(key.as_mut_ptr())) } != ERROR_SUCCESS {
-            continue;
+            return lockers;
         }
         if unsafe { RmRegisterResources(session, Some(&[PCWSTR(path_w.as_ptr())]), None, None) } == ERROR_SUCCESS {
             let (mut needed, mut count, mut reboot) = (0u32, 0u32, 0u32);
@@ -671,8 +692,8 @@ fn restart_manager_lockers(targets: &[(PathBuf, bool)]) -> Vec<Locker> {
         unsafe {
             let _ = RmEndSession(session);
         }
-    }
-    lockers
+        lockers
+    })
 }
 
 // ── 解锁 ─────────────────────────────────────────────────────────
