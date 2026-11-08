@@ -1,0 +1,24 @@
+[package]
+name = "ob-unlock"
+version = "0.1.0"
+edition = "2024"
+description = "文件解锁引擎 (谁锁着文件 / 关句柄 / 结束进程 / 强删 / 重启后删除), obcmd 与 hotkit 共用"
+publish = false
+
+[dependencies]
+log = "0.4"
+# 跟 obcmd / hotkit 锁同一版本, 免得编两份 windows
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_RestartManager",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
