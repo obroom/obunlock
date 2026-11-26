@@ -300,7 +300,7 @@ pub fn schedule_reboot_delete(paths: &[PathBuf]) -> Option<usize> {
     if is_elevated() {
         return Some(paths.iter().map(|p| schedule_delete_on_reboot(p)).sum());
     }
-    let list = std::env::temp_dir().join(format!("ob-unlock-reboot-{}.txt", std::process::id()));
+    let list = std::env::temp_dir().join(format!("obunlock-reboot-{}.txt", std::process::id()));
     let text: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
     std::fs::write(&list, text.join("\n")).ok()?;
     let code = run_as_admin_and_wait(&format!("{REBOOT_DELETE_ARG} \"{}\"", list.display()));
@@ -383,7 +383,7 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("ob_unlock_del_{tag}_{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("obunlock_del_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

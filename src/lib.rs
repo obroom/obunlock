@@ -1,4 +1,4 @@
-//! 文件解锁引擎 (IObit Unlocker 同类), obcmd 与 hotkit 共用。只有引擎, 没有界面 ——
+//! 文件解锁引擎 (IObit Unlocker 同类), obcmd、hotkit、obcleaner 共用。只有引擎, 没有界面 ——
 //! 弹窗 / 确认 / 提示由各自程序做。日志走 `log` 门面, 宿主不装 logger 就不出。
 //!
 //! - [`find_lockers`]: 谁锁着这些文件 / 文件夹 (四路并行检测, 见 `scan.rs`)

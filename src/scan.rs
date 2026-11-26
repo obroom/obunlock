@@ -932,7 +932,7 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("ob_unlock_{tag}_{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("obunlock_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

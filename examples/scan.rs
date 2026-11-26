@@ -2,9 +2,9 @@
 //!   cargo run --release --example scan -- <路径>...
 fn main() {
     let paths: Vec<std::path::PathBuf> = std::env::args().skip(1).map(Into::into).collect();
-    println!("elevated = {}", ob_unlock::is_elevated());
+    println!("elevated = {}", obunlock::is_elevated());
     let t = std::time::Instant::now();
-    let mut ls = ob_unlock::find_lockers(&paths);
+    let mut ls = obunlock::find_lockers(&paths);
     ls.sort_by_key(|l| (l.pid, l.kind as u8));
     for l in &ls {
         println!("{:>6} {:<24} {:?} target#{} handle={:#x} {}", l.pid, l.name, l.kind, l.target, l.handle, l.nt_path);
