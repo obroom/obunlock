@@ -3,6 +3,7 @@ name = "obunlock"
 version = "0.1.0"
 edition = "2024"
 description = "文件解锁引擎 (谁锁着文件 / 关句柄 / 结束进程 / 强删 / 重启后删除), obcmd、hotkit、obcleaner 共用"
+license = "MIT"
 publish = false
 
 [dependencies]
