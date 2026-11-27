@@ -1,16 +1,20 @@
-//! 强删 (解锁后用) + 重启后删除。不走回收站、没有 shell 进度框, 纯引擎, 提示由调用方做。
+//! Force delete (used after unlocking) + delete on reboot. No Recycle Bin and no shell progress dialog:
+//! engine only, the caller handles any messages.
 //!
-//! - 目录树: 先枚举 → 文件多线程并行删 → 目录从最深一层往上、每层并行删 (≤ 8 线程, 思路取自 rmx)
-//! - 每项先用 POSIX 语义删 (带 FORCE_IMAGE_SECTION_CHECK: 运行中 exe / 被加载的 DLL 也能先把名字摘掉,
-//!   自带忽略只读), 不行再清只读走标准库; 杀软 / 索引服务短暂占用退避重试
-//! - 出错不中断: 能删的都删掉, 只剩删不掉的文件和它所在的那条目录链
-//! - `\\?\` 前缀突破 MAX_PATH; 联接点 / 符号链接只删链接本身, 绝不进去
-//! - 危险路径 (盘根 / Windows / Program Files / 用户目录本身) 拒绝
+//! - Directory tree: enumerate first → delete files in parallel → delete directories level by level from
+//!   the deepest up, each level in parallel (≤ 8 threads, idea taken from rmx)
+//! - Each entry is first deleted with POSIX semantics (with FORCE_IMAGE_SECTION_CHECK, so even a running
+//!   exe / loaded DLL has its name removed; read-only is ignored too), otherwise clear read-only and fall
+//!   back to std; short-lived locks from antivirus / the indexer are retried with backoff
+//! - Errors don't stop the run: everything deletable is deleted, leaving only the undeletable files and
+//!   the directory chain they live in
+//! - `\\?\` prefix to get past MAX_PATH; junctions / symlinks are removed as links and never entered
+//! - Dangerous paths (drive roots / Windows / Program Files / the user profile folder itself) are refused
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-/// 删除统计。
+/// Delete counts.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DeleteStats {
     pub files: u64,
@@ -20,19 +24,19 @@ pub struct DeleteStats {
 #[derive(Debug)]
 pub enum DeleteError {
     NotFound,
-    /// 命中危险路径拦截。
+    /// Refused: the target is a dangerous path.
     Protected,
-    /// 有删不掉的, 带第一个出错的路径 + 系统错误串。
+    /// Something couldn't be deleted: the first failing path + the system error text.
     Io { path: String, err: String },
 }
 
-/// 重启后删除的提权助手参数: `<exe> --delete-on-reboot <清单文件>`。宿主在 main 最前面调
-/// [`run_reboot_delete_helper`] 接住它 (要在单实例检查之前)。
+/// Argument for the elevated delete-on-reboot helper: `<exe> --delete-on-reboot <list file>`. The host
+/// handles it by calling [`run_reboot_delete_helper`] at the very top of main (before any single-instance check).
 pub const REBOOT_DELETE_ARG: &str = "--delete-on-reboot";
 
-/// 强删 `target` (绝对路径)。
+/// Force-deletes `target` (an absolute path).
 pub fn force_delete(target: &Path) -> Result<DeleteStats, DeleteError> {
-    // symlink_metadata 不跟随: 目标是联接点时只删链接, 不碰真身
+    // symlink_metadata doesn't follow links: if the target is a junction, delete only the link, not what it points to
     let md = std::fs::symlink_metadata(target).map_err(|_| DeleteError::NotFound)?;
     if is_protected_path(target) {
         return Err(DeleteError::Protected);
@@ -50,8 +54,8 @@ pub fn force_delete(target: &Path) -> Result<DeleteStats, DeleteError> {
 }
 
 fn delete_tree(root: &Path, stats: &mut DeleteStats) -> Result<(), DeleteError> {
-    let mut leaves: Vec<(PathBuf, bool)> = Vec::new(); // (路径, 是目录型链接)
-    let mut dirs: Vec<(usize, PathBuf)> = Vec::new(); // (深度, 路径)
+    let mut leaves: Vec<(PathBuf, bool)> = Vec::new(); // (path, is a directory link)
+    let mut dirs: Vec<(usize, PathBuf)> = Vec::new(); // (depth, path)
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     let mut first_err = None;
     while let Some((dir, depth)) = stack.pop() {
@@ -89,7 +93,8 @@ fn delete_tree(root: &Path, stats: &mut DeleteStats) -> Result<(), DeleteError> 
     first_err.map_or(Ok(()), Err)
 }
 
-/// 多线程删一批互不依赖的条目, 全部试完才返回: (成功数, 第一个错误)。
+/// Deletes a batch of independent entries on several threads and returns only after trying them all:
+/// (number deleted, first error).
 fn par_delete(items: &[(PathBuf, bool)]) -> (u64, Option<DeleteError>) {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8);
@@ -109,7 +114,7 @@ fn par_delete(items: &[(PathBuf, bool)]) -> (u64, Option<DeleteError>) {
         }
     };
     if items.len() < 64 {
-        work(); // 少量不值得开线程
+        work(); // not worth spawning threads for a few items
     } else {
         std::thread::scope(|sc| {
             for _ in 0..workers.min(items.len()) {
@@ -120,7 +125,8 @@ fn par_delete(items: &[(PathBuf, bool)]) -> (u64, Option<DeleteError>) {
     (done.into_inner(), first_err.into_inner().unwrap_or_else(|p| p.into_inner()))
 }
 
-/// 删一项。已经不存在算成功; 拒绝访问 / 共享冲突 / 锁冲突 / 目录非空 退避重试几次。
+/// Deletes one entry. Already gone counts as success; access denied / sharing violation / lock violation /
+/// directory not empty are retried a few times with backoff.
 fn delete_entry(p: &Path, is_dir: bool) -> Result<(), DeleteError> {
     const TRANSIENT: [i32; 4] = [5, 32, 33, 145];
     let mut last: Option<std::io::Error> = None;
@@ -147,7 +153,8 @@ fn delete_entry(p: &Path, is_dir: bool) -> Result<(), DeleteError> {
     Err(io_err(p, last.unwrap_or_else(|| std::io::Error::other("delete failed"))))
 }
 
-/// POSIX 语义删除 (Win10 1809+): 名字立即摘掉, 数据等最后一个引用释放。FAT32 等不支持时返回 false。
+/// POSIX-semantics delete (Win10 1809+): the name goes away immediately, the data when the last reference
+/// is released. Returns false where unsupported (FAT32 etc.).
 fn try_posix_delete(path: &Path) -> bool {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Storage::FileSystem::{
@@ -205,7 +212,7 @@ fn io_err(path: &Path, e: std::io::Error) -> DeleteError {
     DeleteError::Io { path: strip_long_prefix(path), err: e.to_string() }
 }
 
-/// `X:\...` 加 `\\?\` 前缀; 已带前缀 / UNC / 相对路径原样返回。
+/// Adds the `\\?\` prefix to `X:\...`; already-prefixed / UNC / relative paths are returned as is.
 fn to_long_path(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
     let b = s.as_bytes();
@@ -221,8 +228,9 @@ fn strip_long_prefix(p: &Path) -> String {
     s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
 }
 
-/// 危险路径: 盘根 / %SystemRoot% / Program Files (x86) / ProgramData / Users 根 / 当前用户目录。
-/// 只拦这些目录**本身**, 不拦下面的子目录 (删 `C:\Users\me\proj\node_modules` 可以, 删 `C:\Users\me` 不行)。
+/// Dangerous paths: drive roots / %SystemRoot% / Program Files (x86) / ProgramData / the Users folder /
+/// the current user profile. Only these folders **themselves** are blocked, not their subfolders
+/// (deleting `C:\Users\me\proj\node_modules` is fine, deleting `C:\Users\me` is not).
 pub fn is_protected_path(target: &Path) -> bool {
     let norm = normalize(target);
     if norm.is_empty() {
@@ -242,16 +250,17 @@ pub fn is_protected_path(target: &Path) -> bool {
     protected.iter().any(|p| !p.is_empty() && *p == norm)
 }
 
-/// 小写 + 去 `\\?\` + 去结尾 `\`, 比相等用。
+/// Lowercase + strip `\\?\` + strip the trailing `\`, for equality checks.
 fn normalize(p: &Path) -> String {
     strip_long_prefix(p).replace('/', "\\").to_lowercase().trim_end_matches('\\').to_string()
 }
 
-// ── 重启后删除 ───────────────────────────────────────────────────
+// ── Delete on reboot ─────────────────────────────────────────────
 
-/// 登记下次重启时删除 (`MoveFileExW` + `MOVEFILE_DELAY_UNTIL_REBOOT`, 系统在别的程序启动前执行,
-/// 谁占着都挡不住)。**要管理员权限** (登记写在 HKLM)。文件夹: 先文件, 再最深的子目录在前
-/// (系统按登记顺序执行, 删目录时它得已经空了)。返回成功登记的条数。
+/// Schedules deletion at the next reboot (`MoveFileExW` + `MOVEFILE_DELAY_UNTIL_REBOOT`; the system runs it
+/// before other programs start, so no lock can stop it). **Requires admin** (the list lives in HKLM).
+/// Folders: files first, then subdirectories deepest first (the system processes entries in order, and a
+/// directory must be empty by the time it's deleted). Returns the number of entries scheduled.
 pub fn schedule_delete_on_reboot(target: &Path) -> usize {
     use windows::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
     let Ok(md) = std::fs::symlink_metadata(target) else { return 0 };
@@ -269,7 +278,7 @@ pub fn schedule_delete_on_reboot(target: &Path) -> usize {
             let w: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
             let ok = unsafe { MoveFileExW(windows::core::PCWSTR(w.as_ptr()), None, MOVEFILE_DELAY_UNTIL_REBOOT) }.is_ok();
             if !ok {
-                log::warn!("reboot-delete: 登记失败 {}", strip_long_prefix(p));
+                log::warn!("reboot-delete: failed to schedule {}", strip_long_prefix(p));
             }
             ok
         })
@@ -287,15 +296,17 @@ fn collect_post_order(path: &Path, ft: std::fs::FileType, files: &mut Vec<PathBu
         }
         dirs.push(path.to_path_buf());
     } else if ft.is_dir() {
-        dirs.push(path.to_path_buf()); // 目录型链接: 只删链接
+        dirs.push(path.to_path_buf()); // directory link: delete the link only
     } else {
         files.push(path.to_path_buf());
     }
 }
 
-/// 登记一批路径重启后删除, 返回成功条数; `None` = 没拿到管理员权限 (UAC 被拒)。
-/// 已提权直接登记; 否则把清单写进临时文件, 以管理员身份拉起本 exe `--delete-on-reboot <清单>`
-/// 并等它退出 (退出码 = 条数)。**会阻塞到助手结束**, 别在 UI 线程以外的地方指望它马上返回。
+/// Schedules a batch of paths for deletion on reboot and returns the number of entries scheduled;
+/// `None` = admin rights weren't granted (UAC declined). If already elevated, schedules directly;
+/// otherwise writes the list to a temp file, relaunches this exe as admin with
+/// `--delete-on-reboot <list>` and waits for it to exit (exit code = entry count).
+/// **Blocks until the helper exits**, so don't expect it to return right away.
 pub fn schedule_reboot_delete(paths: &[PathBuf]) -> Option<usize> {
     if is_elevated() {
         return Some(paths.iter().map(|p| schedule_delete_on_reboot(p)).sum());
@@ -304,11 +315,12 @@ pub fn schedule_reboot_delete(paths: &[PathBuf]) -> Option<usize> {
     let text: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
     std::fs::write(&list, text.join("\n")).ok()?;
     let code = run_as_admin_and_wait(&format!("{REBOOT_DELETE_ARG} \"{}\"", list.display()));
-    let _ = std::fs::remove_file(&list); // UAC 被拒时助手没跑, 这里清掉
+    let _ = std::fs::remove_file(&list); // if UAC was declined the helper never ran, so clean up here
     code.map(|c| c as usize)
 }
 
-/// 提权助手入口: 命令行是 `--delete-on-reboot <清单>` 就登记、删清单, 返回退出码 (= 条数); 否则 None。
+/// Elevated helper entry point: if the command line is `--delete-on-reboot <list>`, schedules the paths,
+/// deletes the list and returns the exit code (= entry count); otherwise None.
 pub fn run_reboot_delete_helper() -> Option<i32> {
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() != Some(REBOOT_DELETE_ARG) {
@@ -321,7 +333,7 @@ pub fn run_reboot_delete_helper() -> Option<i32> {
     Some(n as i32)
 }
 
-/// 当前进程是否已提权 (管理员)。
+/// Whether the current process is elevated (admin).
 pub fn is_elevated() -> bool {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
@@ -346,7 +358,8 @@ pub fn is_elevated() -> bool {
     }
 }
 
-/// 以管理员身份运行本 exe (隐藏窗口), 等它退出返回退出码。UAC 被拒 / 启动失败返回 None。
+/// Runs this exe as admin (hidden window), waits for it to exit and returns its exit code.
+/// None if UAC is declined or the launch fails.
 fn run_as_admin_and_wait(args: &str) -> Option<u32> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
@@ -395,13 +408,13 @@ mod tests {
         assert!(is_protected_path(Path::new("C:")));
         let sys = std::env::var("SystemRoot").unwrap();
         assert!(is_protected_path(Path::new(&sys)));
-        assert!(is_protected_path(Path::new(&format!(r"\\?\{sys}\"))), "前缀 / 尾斜杠不影响");
+        assert!(is_protected_path(Path::new(&format!(r"\\?\{sys}\"))), "prefix / trailing slash don't matter");
         let home = std::env::var("USERPROFILE").unwrap();
         assert!(is_protected_path(Path::new(&home)));
-        assert!(!is_protected_path(Path::new(&format!(r"{home}\proj\node_modules"))), "子目录不拦");
+        assert!(!is_protected_path(Path::new(&format!(r"{home}\proj\node_modules"))), "subfolders are not blocked");
     }
 
-    /// 只读文件、深层嵌套、超过 MAX_PATH、一百多个文件 (走多线程) 都删得掉
+    /// Read-only files, deep nesting, paths over MAX_PATH and 100+ files (multithreaded path) all get deleted
     #[test]
     fn deletes_tree_with_readonly_and_long_paths() {
         let root = tmp("tree");
@@ -421,12 +434,12 @@ mod tests {
         std::fs::set_permissions(&ro, perm).unwrap();
         assert!(deep.to_string_lossy().len() > 260);
 
-        let st = force_delete(&root).expect("应全删掉");
+        let st = force_delete(&root).expect("everything should be deleted");
         assert_eq!(st.files, 122);
         assert!(!root.exists());
     }
 
-    /// 联接点只删链接本身, 指向的真身原封不动
+    /// A junction is deleted as a link only; what it points to stays untouched
     #[test]
     fn junction_deletes_link_only() {
         let root = tmp("junc");
@@ -442,10 +455,10 @@ mod tests {
             .unwrap()
             .status
             .success();
-        assert!(ok, "mklink /J 失败");
-        force_delete(&victim).expect("应删掉");
+        assert!(ok, "mklink /J failed");
+        force_delete(&victim).expect("should be deleted");
         assert!(!victim.exists());
-        assert!(real.join("keep.txt").exists(), "真身不能被删");
+        assert!(real.join("keep.txt").exists(), "the link target must not be deleted");
         let _ = std::fs::remove_dir_all(&root);
     }
 

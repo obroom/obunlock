@@ -1,22 +1,29 @@
-//! 找出"谁锁着这个文件/文件夹", 以及解锁 (关句柄 / 结束进程)。
+//! Find out "who is locking this file / folder", and unlock it (close the handle / end the process).
 //!
-//! 四路互补, 并行跑 (总耗时 ≈ 最慢的一路):
-//! 1. 全系统句柄扫描 (`Handle`, 可关句柄): `NtQuerySystemInformation(SystemExtendedHandleInformation)`
-//!    → 逐个 `DuplicateHandle` 进本进程 → `NtQueryObject` 取类型 (筛 File) 和对象名 (NT 设备路径) → 比对。
-//! 2. 映射扫描 (`Image`): 进程主 exe / 已加载 DLL / 内存映射的数据文件在目标内 —— 那是 Section 不是
-//!    File 句柄, 1 看不到 (运行中程序的文件夹删不掉就是这个)。
-//! 3. 文件侧反查 (`InUse`, FileProcessIdsUsingFileInformation): 问文件"谁开着你", 能看到 1 打不开的
-//!    进程 (受保护进程 / 未提权时的管理员进程 / System)。文件夹遍历内部条目 (有上限)。
-//! 4. Restart Manager (`InUse`): 官方"文件正在使用"机制, 只对文件做。
+//! Four complementary scans run in parallel (total time ≈ the slowest one):
+//! 1. System-wide handle scan (`Handle`, closable): `NtQuerySystemInformation(SystemExtendedHandleInformation)`
+//!    → `DuplicateHandle` each into this process → `NtQueryObject` for the type (keep File) and the object
+//!    name (NT device path) → compare.
+//! 2. Mapping scan (`Image`): the process's main exe / a loaded DLL / a memory-mapped data file is inside
+//!    the target. That's a Section, not a File handle, so scan 1 can't see it (this is why the folder of a
+//!    running program can't be deleted).
+//! 3. File-side lookup (`InUse`, FileProcessIdsUsingFileInformation): ask the file "who has you open"; sees
+//!    processes scan 1 can't open (protected processes / admin processes when not elevated / System).
+//!    For folders, the entries inside are walked (with a cap).
+//! 4. Restart Manager (`InUse`): the official "file in use" mechanism, files only.
 //!
-//! ## 挂死与速度 (合并两边的处理)
-//! - `NtQueryObject(名字)` 对命名管道等句柄会永久挂起: 先 `GetFileType` 只给磁盘文件查名字,
-//!   再放 worker 线程 + 超时, 挂住就弃线程换新的 (一次扫描最多泄漏个位数线程/句柄)。
-//!   **不要按 GrantedAccess==0x0012019F 跳过**: 那正是 GENERIC_READ|GENERIC_WRITE 打开文件的掩码,
-//!   跳过它等于漏掉所有读写打开的文件 (Office / 编辑器 / 数据库), 两边都实测漏检过。
-//! - 首次识别出 File 类型的 ObjectTypeIndex 后缓存, 非 File 句柄连 Duplicate 都省了。
-//! - 同一内核文件对象常被许多句柄共享 (系统 DLL 几十个进程开着), 名字按对象指针缓存, 只查一次。
-//! - 句柄扫描总预算 [`BUDGET`], 极端环境到点就返回已找到的。
+//! ## Hangs and speed
+//! - `NtQueryObject(name)` hangs forever on named pipes and similar handles: first `GetFileType` so only
+//!   disk files get a name query, then run it on a worker thread with a timeout; if it hangs, abandon that
+//!   thread and start a new one (one scan leaks at most a handful of threads / handles).
+//!   **Don't skip GrantedAccess == 0x0012019F**: that's exactly the mask of a file opened with
+//!   GENERIC_READ | GENERIC_WRITE. Skipping it misses every file opened for read-write (Office / editors /
+//!   databases); this has caused missed detections in practice.
+//! - The ObjectTypeIndex of the File type is cached once identified, so non-File handles aren't even duplicated.
+//! - One kernel file object is often shared by many handles (system DLLs are open in dozens of processes),
+//!   so names are cached by object pointer and queried only once.
+//! - The handle scan has an overall budget, [`BUDGET`]; in extreme environments it returns what it has found
+//!   when time runs out.
 
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
@@ -38,44 +45,53 @@ use crate::process::{
     process_start_time, process_start_time_of,
 };
 
-/// 一条占用记录: 某进程以某种方式锁着第 `target` 个目标。同一进程可能有多条。
+/// One lock record: a process locks target number `target` in some way. A process may have several.
 #[derive(Debug, Clone)]
 pub struct Locker {
     pub pid: u32,
     pub name: String,
-    /// **源进程里**的句柄值 (`kind == Handle` 才非 0), 供强制关闭用。
+    /// Handle value **in the source process** (non-zero only when `kind == Handle`), used to force-close it.
     pub handle: usize,
-    /// 进程创建时间 (0 = 没查到)。动手前重查比对, 防 PID 重用误伤无辜新进程。
+    /// Process creation time (0 = unknown). Re-checked before acting, so an innocent new process with a
+    /// reused PID isn't hit.
     pub start: u64,
-    /// 命中的目标下标 (`find_lockers` 入参的索引)。嵌套多选时只记第一个命中的。
+    /// Index of the matched target (into the `find_lockers` argument). With nested targets, only the first
+    /// match is recorded.
     pub target: usize,
     pub kind: LockKind,
-    /// 扫描当时这个句柄指向的 NT 路径 (小写, 只 `Handle` 有)。关之前再核对一遍 —— 从扫描到用户点确定
-    /// 隔着一个窗口, 目标进程完全可能关掉句柄、内核又把同一个值分给别的文件, 不核对就会静默关错。
+    /// NT path this handle pointed to at scan time (lowercase, `Handle` only). Checked again before closing:
+    /// between the scan and the user clicking OK, the process may close the handle and the kernel may hand
+    /// the same value to another file; without the check, the wrong handle would be closed silently.
     pub nt_path: String,
 }
 
-/// 占用来源, 决定解锁手段, 也决定去重: 同一 (pid, 目标) 已有 Handle / Image 时 InUse 是冗余的 ——
-/// 留着会让「解锁」把只需关句柄的进程也结束掉。
+/// Where a lock was found. Decides how to unlock and how to dedupe: when the same (pid, target) already has
+/// a Handle / Image record, InUse is redundant, and keeping it would make "unlock" end a process that only
+/// needed a handle closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockKind {
-    /// 句柄扫描命中, 句柄可关。
+    /// Found by the handle scan; the handle can be closed.
     Handle,
-    /// 进程把目标映射进了内存 (主 exe / DLL / 映射的数据文件), 没有可关的句柄, 只能结束进程。
+    /// The process has the target mapped into memory (main exe / DLL / mapped data file). No handle to
+    /// close, so the process has to be ended.
     Image,
-    /// 文件系统 / Restart Manager 说它在用, 句柄扫描看不到 (受保护 / 权限不够), 只能结束进程。
+    /// The file system / Restart Manager says it's in use, but the handle scan can't see it (protected /
+    /// not enough rights). The process has to be ended.
     InUse,
 }
 
-/// 句柄扫描总预算: 到点就返回已找到的。一次性操作, 用户在等, 够用了。
+/// Overall budget for the handle scan: when it runs out, return what has been found. A one-off operation
+/// with the user waiting; this is plenty.
 const BUDGET: Duration = Duration::from_secs(12);
-/// 单个句柄查名超时。磁盘文件查名是微秒级, 管道已被 GetFileType 筛掉, 这是兜底。
+/// Name query timeout per handle. Disk-file name queries take microseconds and pipes are already filtered
+/// out by GetFileType; this is a safety net.
 const NAME_TIMEOUT: Duration = Duration::from_millis(80);
-/// 文件侧反查时文件夹内部最多问这么多条 / 花这么久 (node_modules 逐个打开太慢, 只是兜底)。
+/// Caps on how many entries inside a folder the file-side lookup asks about, and for how long (opening
+/// every file in node_modules is too slow; this is only a fallback).
 const IN_USE_MAX_ENTRIES: usize = 20_000;
 const IN_USE_BUDGET: Duration = Duration::from_millis(1500);
 
-// ── ntdll 动态绑定 ──────────────────────────────────────────────
+// ── ntdll dynamic binding ───────────────────────────────────────
 
 type NtQuerySystemInformationFn = unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
 type NtQueryObjectFn = unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32, *mut u32) -> i32;
@@ -109,7 +125,7 @@ fn nt_query_information_file() -> Option<NtQueryInformationFileFn> {
     ntdll_fn(s!("NtQueryInformationFile"), &F).map(|a| unsafe { std::mem::transmute(a) })
 }
 
-// ── 内核结构 (x64 布局) ─────────────────────────────────────────
+// ── Kernel structures (x64 layout) ──────────────────────────────
 
 #[repr(C)]
 struct SystemHandleTableEntryInfoEx {
@@ -127,7 +143,7 @@ struct SystemHandleTableEntryInfoEx {
 struct SystemHandleInformationEx {
     number_of_handles: usize,
     reserved: usize,
-    // handles: [SystemHandleTableEntryInfoEx; number_of_handles] 紧随其后
+    // followed by handles: [SystemHandleTableEntryInfoEx; number_of_handles]
 }
 
 #[repr(C)]
@@ -143,12 +159,13 @@ struct IoStatusBlock {
     information: usize,
 }
 
-// ── 目标 ─────────────────────────────────────────────────────────
+// ── Targets ──────────────────────────────────────────────────────
 
-/// 一个待比对的目标。`nt` 跟 NtQueryObject / GetMappedFileName 同形态 (`\device\harddiskvolume3\...`),
-/// `dos` 跟进程镜像路径同形态 (`c:\...`), 都已小写、去尾部 `\`。两者都取**最终路径**
-/// (GetFinalPathNameByHandle): 8.3 短名 / subst 盘 / 挂载点会被展开成内核实际记录的那份,
-/// 网络路径 (`\device\mup\...`) 也能比。打不开时退回字符串换算。
+/// A target to compare against. `nt` has the same form as NtQueryObject / GetMappedFileName output
+/// (`\device\harddiskvolume3\...`), `dos` the same form as process image paths (`c:\...`); both are lowercase
+/// with no trailing `\`. Both are **final paths** (GetFinalPathNameByHandle): 8.3 short names / subst drives /
+/// mount points are expanded to what the kernel actually records, and network paths (`\device\mup\...`)
+/// compare too. If the target can't be opened, falls back to string conversion.
 struct Spec {
     nt: String,
     dos: String,
@@ -157,7 +174,7 @@ struct Spec {
 }
 
 impl Spec {
-    /// `name` (已小写) 命中: 完全相等, 或目标是文件夹且 `name` 在它里面。
+    /// `name` (already lowercase) matches: equal, or the target is a folder and `name` is inside it.
     fn hit(&self, name: &str, use_nt: bool) -> bool {
         hit(if use_nt { &self.nt } else { &self.dos }, self.is_dir, name)
     }
@@ -182,8 +199,8 @@ fn build_specs(targets: &[(PathBuf, bool)]) -> Vec<Spec> {
         .collect()
 }
 
-/// 只要属性访问权打开 (不受共享模式限制, 被独占锁住也打得开), 取最终路径。
-/// `nt=true` 返回 `\Device\...` 形态, 否则 DOS 形态 (带 `\\?\`)。
+/// Gets the final path by opening with attribute access only (not subject to share modes, so it opens even
+/// when exclusively locked). `nt=true` returns the `\Device\...` form, otherwise the DOS form (with `\\?\`).
 fn final_path(p: &Path, nt: bool) -> Option<String> {
     use windows::Win32::Storage::FileSystem::{FILE_NAME_NORMALIZED, GETFINALPATHNAMEBYHANDLE_FLAGS, GetFinalPathNameByHandleW};
     const VOLUME_NAME_NT: u32 = 0x2;
@@ -201,7 +218,7 @@ fn final_path(p: &Path, nt: bool) -> Option<String> {
     (n > 0 && n < buf.len()).then(|| String::from_utf16_lossy(&buf[..n]))
 }
 
-/// 只带 FILE_READ_ATTRIBUTES 打开文件或目录 (BACKUP_SEMANTICS 允许开目录)。
+/// Opens a file or directory with FILE_READ_ATTRIBUTES only (BACKUP_SEMANTICS allows opening directories).
 fn open_attr_only(p: &Path) -> Option<HANDLE> {
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -222,16 +239,18 @@ fn open_attr_only(p: &Path) -> Option<HANDLE> {
     .ok()
 }
 
-// ── 公开 API ─────────────────────────────────────────────────────
+// ── Public API ───────────────────────────────────────────────────
 
-/// 找出锁住任意目标 (文件或文件夹) 的所有进程。目标是文件夹时, 里面任意子项被占用也算
-/// (删不掉的常见根因)。结果按 (pid, 目标) 去重: 已有 Handle / Image 的不再留 InUse。
+/// Finds every process locking any of the targets (files or folders). For a folder, a lock on anything
+/// inside it counts too (the usual reason it can't be deleted). Results are deduped by (pid, target): InUse
+/// is dropped where Handle / Image already exists.
 ///
-/// **必须在后台线程调** —— 全系统枚举几百 ms 到几秒。失败 / 无占用返回空。
+/// **Call it off the UI thread**: a system-wide scan takes hundreds of ms to a few seconds. Returns an empty
+/// list on failure or when nothing is locked.
 pub fn find_lockers(targets: &[PathBuf]) -> Vec<Locker> {
     enable_se_debug_privilege();
     let t0 = Instant::now();
-    // symlink_metadata: 联接点 / 链接本身不算文件夹 (删的也只是链接)
+    // symlink_metadata: a junction / link itself doesn't count as a folder (only the link gets deleted)
     let targets: Vec<(PathBuf, bool)> =
         targets.iter().map(|p| (p.clone(), std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))).collect();
     let specs = build_specs(&targets);
@@ -241,7 +260,7 @@ pub fn find_lockers(targets: &[PathBuf]) -> Vec<Locker> {
 
     let specs = &specs;
     let targets = &targets;
-    // 四路同时跑 (第 4 路在本线程), 总耗时 ≈ 最慢的那路
+    // Run all four scans at once (scan 4 on this thread); total time ≈ the slowest one
     let (mut lockers, [t_handles, t_images, t_in_use, t_rm]) = std::thread::scope(|sc| {
         let timed = |f: fn(&[Spec]) -> Vec<Locker>| {
             move || {
@@ -288,13 +307,15 @@ pub fn find_lockers(targets: &[PathBuf]) -> Vec<Locker> {
     lockers
 }
 
-/// 这条占用的解锁方式是结束进程, 而且这个进程允许结束 —— 点「解锁」前要不要先确认"将结束进程"。
+/// Unlocking this record means ending the process, and that process may be ended. Use it to decide whether
+/// to warn "this will end the process" before unlocking.
 pub fn will_kill(l: &Locker) -> bool {
     l.handle == 0 && !is_critical_process(l.pid)
 }
 
-/// 解锁: 能关的句柄关掉; 没有句柄可关的 (映射 / 只知道在用) 结束进程 (调用方已确认过)。
-/// 系统关键进程两样都不碰。返回解除的处数。
+/// Unlock: close the handles that can be closed; end the processes with no handle to close (mapped / only
+/// known to be in use), which the caller has already confirmed. System-critical processes are never
+/// touched either way. Returns the number of locks released.
 pub fn release(lockers: &[Locker]) -> usize {
     let mut n = lockers.iter().filter(|l| l.handle != 0 && close_handle(l)).count();
     let mut seen: Vec<u32> = Vec::new();
@@ -307,7 +328,8 @@ pub fn release(lockers: &[Locker]) -> usize {
     n
 }
 
-/// 强制模式: 每个占用进程都结束 (同样跳过关键进程 / explorer)。返回结束了几个。
+/// Forceful mode: end every locking process (still skipping critical processes / explorer). Returns how many
+/// were ended.
 pub fn kill_all(lockers: &[Locker]) -> usize {
     let mut seen: Vec<u32> = Vec::new();
     let mut n = 0;
@@ -320,9 +342,9 @@ pub fn kill_all(lockers: &[Locker]) -> usize {
     n
 }
 
-// ── 第 1 路: 句柄扫描 ───────────────────────────────────────────
+// ── Scan 1: handles ─────────────────────────────────────────────
 
-/// 进程名 / 创建时间按 pid 缓存 (几路扫描都要)。
+/// Process name / creation time cached by pid (several scans need them).
 #[derive(Default)]
 struct ProcInfoCache {
     names: std::collections::HashMap<u32, String>,
@@ -360,7 +382,7 @@ fn handle_lockers(specs: &[Spec]) -> Vec<Locker> {
     let mut file_type_index: Option<u16> = None;
     let mut lockers: Vec<Locker> = Vec::new();
     let mut querier = NameQuerier::new();
-    // 内核对象指针 → 对象名 (None = 无名 / 查不到 / 不是磁盘文件)
+    // kernel object pointer → object name (None = unnamed / query failed / not a disk file)
     let mut obj_names: std::collections::HashMap<usize, Option<String>> = std::collections::HashMap::new();
     let started = Instant::now();
 
@@ -372,20 +394,22 @@ fn handle_lockers(specs: &[Spec]) -> Vec<Locker> {
 
     for i in 0..count {
         if started.elapsed() > BUDGET {
-            log::warn!("unlock: 句柄扫描超预算, 已查 {i}/{count}, 提前返回");
+            log::warn!("unlock: handle scan over budget after {i}/{count}, returning early");
             break;
         }
         let entry = unsafe { &*entries_ptr.add(i) };
         let pid = entry.unique_process_id as u32;
-        // System (pid 4) 不跳过: 驱动 / SMB 共享代开的文件句柄挂在它名下。只展示, 不会去关 (见 close_handle)
+        // Don't skip System (pid 4): file handles opened by drivers / SMB shares live under it.
+        // Shown only, never closed (see close_handle)
         if pid == our_pid || pid == 0 {
             continue;
         }
         if file_type_index.is_some_and(|idx| entry.object_type_index != idx) {
             continue;
         }
-        // 未提权时 (Win11 24H2+ 无 SeDebugPrivilege) 内核对象指针全被抹成 0, 不能当缓存键,
-        // 否则第一个句柄的查名结果会套到所有句柄上。为 0 时不读不写缓存, 逐个查名
+        // When not elevated (Win11 24H2+ without SeDebugPrivilege), kernel object pointers are all zeroed and
+        // can't be a cache key, or the first handle's name would be applied to every handle. For 0, skip the
+        // cache and query each name
         let obj = entry.object as usize;
         if let Some(cached) = obj_names.get(&obj).filter(|_| obj != 0) {
             if let Some(name) = cached {
@@ -398,7 +422,7 @@ fn handle_lockers(specs: &[Spec]) -> Vec<Locker> {
             .entry(pid)
             .or_insert_with(|| unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, pid) }.unwrap_or_default());
         if src.is_invalid() {
-            continue; // 打不开 (权限 / 已退) → 第 3 路兜底
+            continue; // can't open it (rights / already exited) → scan 3 covers it
         }
         let mut dup = HANDLE::default();
         let ok = unsafe {
@@ -433,7 +457,8 @@ fn handle_lockers(specs: &[Spec]) -> Vec<Locker> {
                 }
             }
             QueryResult::TimedOut => {
-                // 卡死: 记成无名 (同对象别再卡一次), 弃 dup (旧 worker 可能还在用它), 换新 worker
+                // Hung: record as unnamed (don't hang on the same object again), abandon dup (the old worker
+                // may still be using it), start a new worker
                 if obj != 0 {
                     obj_names.insert(obj, None);
                 }
@@ -452,11 +477,13 @@ fn handle_lockers(specs: &[Spec]) -> Vec<Locker> {
     lockers
 }
 
-// ── 第 2 路: 映射扫描 ───────────────────────────────────────────
+// ── Scan 2: mappings ────────────────────────────────────────────
 
-/// 逐段 `VirtualQueryEx` 遍历对方地址空间, 每个 MEM_IMAGE / MEM_MAPPED 分配 (按 AllocationBase 只查一次)
-/// 用 `GetMappedFileNameW` 取 NT 路径比对。打不开内存的进程退回只比主 exe 路径。
-/// 同一进程可能既开着句柄又映射着目标: Handle 负责关句柄, Image 负责结束进程, 不能跨 kind 去重。
+/// Walks the other process's address space region by region with `VirtualQueryEx`; for each MEM_IMAGE /
+/// MEM_MAPPED allocation (once per AllocationBase), gets the NT path with `GetMappedFileNameW` and compares.
+/// For processes whose memory can't be opened, falls back to comparing only the main exe path.
+/// A process may both hold a handle and map the target: Handle closes the handle, Image ends the process,
+/// so don't dedupe across kinds.
 fn image_lockers(specs: &[Spec]) -> Vec<Locker> {
     let pids = all_pids();
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
@@ -479,7 +506,7 @@ fn image_lockers_for(pids: &[u32], specs: &[Spec]) -> Vec<Locker> {
 
     for &pid in pids {
         if pid == our_pid || pid <= 4 {
-            continue; // System 没有用户态映射
+            continue; // System has no user-mode mappings
         }
         let mut hits: Vec<usize> = Vec::new();
         let mut add = |idx: usize| {
@@ -553,7 +580,7 @@ fn all_pids() -> Vec<u32> {
     pids
 }
 
-// ── 第 3 路: 文件侧反查 ─────────────────────────────────────────
+// ── Scan 3: file-side lookup ────────────────────────────────────
 
 fn in_use_lockers(targets: &[(PathBuf, bool)]) -> Vec<Locker> {
     let Some(nt_qif) = nt_query_information_file() else {
@@ -561,8 +588,9 @@ fn in_use_lockers(targets: &[(PathBuf, bool)]) -> Vec<Locker> {
     };
     let our_pid = unsafe { GetCurrentProcessId() };
     let deadline = Instant::now() + IN_USE_BUDGET;
-    // 先列出要问的 (路径, 第几个目标, 是不是选中项本身), 文件夹往里走; 再分给几个线程问 ——
-    // 系统每问一个文件要 ~40ms (实测, 跟打开文件无关), 串行问 40 个就是一秒多
+    // First list what to ask about (path, target index, is it the selected item itself), walking into
+    // folders; then split the queries across threads. Each query takes ~40ms (measured, regardless of
+    // opening the file), so asking about 40 files serially takes over a second
     let mut ask: Vec<(PathBuf, usize, bool)> = Vec::new();
     for (idx, (root, is_dir)) in targets.iter().enumerate() {
         let mut stack = vec![root.clone()];
@@ -570,7 +598,7 @@ fn in_use_lockers(targets: &[(PathBuf, bool)]) -> Vec<Locker> {
             if *is_dir && ask.len() < IN_USE_MAX_ENTRIES && Instant::now() < deadline {
                 for e in std::fs::read_dir(&p).into_iter().flatten().flatten() {
                     match e.file_type() {
-                        Ok(ft) if ft.is_symlink() => {} // 联接点 / 链接指向的东西不在这个文件夹里
+                        Ok(ft) if ft.is_symlink() => {} // what a junction / link points to isn't in this folder
                         Ok(ft) if ft.is_dir() => stack.push(e.path()),
                         Ok(_) => ask.push((e.path(), idx, false)),
                         Err(_) => {}
@@ -582,7 +610,7 @@ fn in_use_lockers(targets: &[(PathBuf, bool)]) -> Vec<Locker> {
         }
     }
     let hits = par_flat_map(&ask, |(p, idx, root)| {
-        // 选中项本身一定问; 文件夹里面的到点就不问了
+        // Always ask about the selected item itself; entries inside folders are skipped once time is up
         if !root && Instant::now() >= deadline {
             return Vec::new();
         }
@@ -596,10 +624,12 @@ fn in_use_lockers(targets: &[(PathBuf, bool)]) -> Vec<Locker> {
     hits.into_iter().filter(|&h| found.insert(h)).map(|(pid, idx)| info.locker(pid, 0, idx, LockKind::InUse, "")).collect()
 }
 
-/// 并行问系统用的线程数。in_use / RM 每个文件几十到上百毫秒, 实测 40 个文件 8 线程: in_use 1.6s → 0.24s, RM 5.8s → 0.88s
+/// Threads used to query the system in parallel. in_use / RM take tens to 100+ ms per file; measured with
+/// 40 files on 8 threads: in_use 1.6s → 0.24s, RM 5.8s → 0.88s
 const PAR_THREADS: usize = 8;
 
-/// 把 items 平均分给最多 PAR_THREADS 个线程, 各自 f 出一串结果, 合起来 (结果自带归属, 不管顺序)
+/// Splits items evenly across up to PAR_THREADS threads, runs f on each and concatenates the results
+/// (each result carries its own owner, so order doesn't matter)
 fn par_flat_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> Vec<R> + Sync) -> Vec<R> {
     if items.is_empty() {
         return Vec::new();
@@ -614,10 +644,10 @@ fn par_flat_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> Vec<R> + Sync) 
     })
 }
 
-/// 开着 `p` 的进程 pid (含本进程自己 —— 查询时我们也开着它)。
+/// PIDs of processes that have `p` open (including this one: we hold it open while querying).
 fn pids_using(nt_qif: NtQueryInformationFileFn, p: &Path) -> Vec<u32> {
     let Some(h) = open_attr_only(p) else { return Vec::new() };
-    // FILE_PROCESS_IDS_USING_FILE_INFORMATION: ULONG 计数, 对齐后接 ULONG_PTR[]
+    // FILE_PROCESS_IDS_USING_FILE_INFORMATION: a ULONG count, then (after alignment) ULONG_PTR[]
     let mut buf = vec![0usize; 64];
     let mut pids = Vec::new();
     for _ in 0..4 {
@@ -647,10 +677,11 @@ fn pids_using(nt_qif: NtQueryInformationFileFn, p: &Path) -> Vec<u32> {
     pids
 }
 
-// ── 第 4 路: Restart Manager ───────────────────────────────────
+// ── Scan 4: Restart Manager ─────────────────────────────────────
 
-/// 只对文件做 (目录不能被加载为模块, RM 也不递归)。每个文件单独一个会话 —— RmGetList 不区分
-/// 命中的是哪个资源, 合在一起就没法按文件归属。被占的文件一个会话 ~135ms, 所以各会话分给几个线程同时跑。
+/// Files only (a directory can't be loaded as a module, and RM doesn't recurse). One session per file:
+/// RmGetList doesn't say which resource matched, so a shared session couldn't attribute results to files.
+/// A session on a locked file takes ~135ms, so sessions are spread across threads.
 fn restart_manager_lockers(targets: &[(PathBuf, bool)]) -> Vec<Locker> {
     use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
     use windows::Win32::System::RestartManager::{
@@ -696,19 +727,22 @@ fn restart_manager_lockers(targets: &[(PathBuf, bool)]) -> Vec<Locker> {
     })
 }
 
-// ── 解锁 ─────────────────────────────────────────────────────────
+// ── Unlocking ────────────────────────────────────────────────────
 
-/// 强制关闭 `l` 记录的那个句柄 (DuplicateHandle + DUPLICATE_CLOSE_SOURCE 在源进程里关掉)。
+/// Force-closes the handle recorded in `l` (DuplicateHandle + DUPLICATE_CLOSE_SOURCE closes it in the
+/// source process).
 ///
-/// **高危**: 目标程序不知道句柄没了, 继续用会崩 / 坏数据。调用方须已确认。
-/// 动手前三道闸: 进程创建时间对得上 → 先只读复制一份看它现在指向哪儿 → 路径跟扫描时一致才真关。
-/// 系统关键进程一律拒绝: System 的句柄表就是内核句柄表, 关掉驱动在用的句柄会蓝屏。
+/// **Dangerous**: the target program doesn't know its handle is gone; using it again may crash it or
+/// corrupt data. The caller must have confirmed. Three checks before acting: the process creation time
+/// matches → duplicate it once read-only to see what it points to now → close it only if the path matches
+/// the scan. System-critical processes are always refused: System's handle table is the kernel handle
+/// table, and closing a handle a driver is using blue-screens the machine.
 pub fn close_handle(l: &Locker) -> bool {
     if l.handle == 0 || l.nt_path.is_empty() {
-        return false; // 没有可关的句柄 (映射 / 只知道在用), 只能结束进程
+        return false; // no handle to close (mapped / only known to be in use); the process has to be ended
     }
     if is_critical_process(l.pid) {
-        log::warn!("unlock: 拒绝在系统关键进程 {} (pid {}) 里关句柄", l.name, l.pid);
+        log::warn!("unlock: refusing to close a handle in system-critical process {} (pid {})", l.name, l.pid);
         return false;
     }
     enable_se_debug_privilege();
@@ -717,36 +751,36 @@ pub fn close_handle(l: &Locker) -> bool {
             return false;
         };
         let bail = |why: String| {
-            log::warn!("unlock: 放弃关闭 {} (pid {}) 的句柄 —— {why}", l.name, l.pid);
+            log::warn!("unlock: not closing handle in {} (pid {}): {why}", l.name, l.pid);
             let _ = CloseHandle(src);
             false
         };
 
-        // 闸 1: PID 没被重用
+        // Check 1: the PID hasn't been reused
         if l.start != 0 && process_start_time_of(src).is_some_and(|now| now != l.start) {
-            return bail("创建时间与扫描时不符, PID 已被重用".into());
+            return bail("creation time differs from the scan, PID was reused".into());
         }
 
-        // 闸 2: 复制一份**不带** CLOSE_SOURCE 的, 看这个句柄值现在指向什么
+        // Check 2: duplicate it **without** CLOSE_SOURCE to see what this handle value points to now
         let mut probe = HANDLE::default();
         if DuplicateHandle(src, HANDLE(l.handle as *mut c_void), GetCurrentProcess(), &mut probe, 0, false, DUPLICATE_SAME_ACCESS)
             .is_err()
         {
-            return bail("句柄已不存在".into());
+            return bail("the handle no longer exists".into());
         }
-        // 走带超时的 worker: 万一这个值被重用成了阻塞管道, 同步查名会挂死
+        // Use the worker with a timeout: if the value was reused for a blocking pipe, a synchronous name query would hang
         match NameQuerier::new().query(probe.0 as usize) {
             QueryResult::Ok(Some(now)) if now.to_lowercase() == l.nt_path => {
                 let _ = CloseHandle(probe);
             }
-            QueryResult::TimedOut => return bail("核对对象名超时".into()), // probe 不能关, worker 可能还在用
+            QueryResult::TimedOut => return bail("timed out checking the object name".into()), // don't close probe, the worker may still be using it
             QueryResult::Ok(other) => {
                 let _ = CloseHandle(probe);
-                return bail(format!("句柄已改指向 {}, 不再是 {}", other.as_deref().unwrap_or("<无名>"), l.nt_path));
+                return bail(format!("the handle now points to {}, no longer {}", other.as_deref().unwrap_or("<unnamed>"), l.nt_path));
             }
         }
 
-        // 闸 3: 真关
+        // Check 3: close it for real
         let mut sink = HANDLE::default();
         let ok =
             DuplicateHandle(src, HANDLE(l.handle as *mut c_void), GetCurrentProcess(), &mut sink, 0, false, DUPLICATE_CLOSE_SOURCE)
@@ -759,21 +793,22 @@ pub fn close_handle(l: &Locker) -> bool {
     }
 }
 
-/// 按 pid 结束进程。`expected_start` = 扫描时记的创建时间 (0 = 当时就没权限查, 没得比)。
-/// 在**同一个进程句柄**上核对, 查验与终止之间进程对象不会换人。
-/// 拒绝: 系统关键进程 / explorer / 认不出是谁 / 创建时间对不上或查不到。
+/// Ends a process by pid. `expected_start` = creation time recorded by the scan (0 = no rights to read it
+/// then, nothing to compare). Checked on **the same process handle**, so the process object can't change
+/// between the check and the termination. Refuses: system-critical processes / explorer / unidentifiable
+/// processes / creation time mismatched or unreadable.
 pub fn terminate(pid: u32, expected_start: u64) -> bool {
     if is_critical_process(pid) {
-        log::warn!("unlock: 拒绝结束系统关键进程 pid {pid}");
+        log::warn!("unlock: refusing to end system-critical process pid {pid}");
         return false;
     }
-    // 名字查不到就不杀: "认不出是谁"反而放行, 保护名单就形同虚设
+    // No name, no kill: letting "can't tell what it is" through would make the protected list pointless
     let Some(name) = process_basename(pid) else {
-        log::warn!("unlock: 认不出 pid {pid} 是什么进程, 拒绝结束");
+        log::warn!("unlock: can't identify pid {pid}, refusing to end it");
         return false;
     };
     if KILL_PROTECTED.contains(&name.to_ascii_lowercase().as_str()) {
-        log::warn!("unlock: 拒绝结束受保护进程 {name} (pid {pid})");
+        log::warn!("unlock: refusing to end protected process {name} (pid {pid})");
         return false;
     }
     enable_se_debug_privilege();
@@ -782,7 +817,7 @@ pub fn terminate(pid: u32, expected_start: u64) -> bool {
             return false;
         };
         if expected_start != 0 && process_start_time_of(h) != Some(expected_start) {
-            log::warn!("unlock: pid {pid} 创建时间对不上或查不到 (PID 可能已重用), 拒绝结束");
+            log::warn!("unlock: pid {pid} creation time mismatched or unreadable (PID may be reused), refusing to end it");
             let _ = CloseHandle(h);
             return false;
         }
@@ -792,9 +827,9 @@ pub fn terminate(pid: u32, expected_start: u64) -> bool {
     }
 }
 
-// ── 内部 helper ─────────────────────────────────────────────────
+// ── Internal helpers ────────────────────────────────────────────
 
-/// 反复扩容调用 NtQuerySystemInformation 直到装得下整张句柄表。
+/// Calls NtQuerySystemInformation with a growing buffer until the whole handle table fits.
 fn snapshot_handles(nt_qsi: NtQuerySystemInformationFn) -> Option<Vec<u8>> {
     let mut size = 1024 * 1024;
     for _ in 0..8 {
@@ -802,7 +837,7 @@ fn snapshot_handles(nt_qsi: NtQuerySystemInformationFn) -> Option<Vec<u8>> {
         let mut ret_len = 0u32;
         let st = unsafe { nt_qsi(SYSTEM_EXTENDED_HANDLE_INFORMATION, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut ret_len) };
         if st == STATUS_INFO_LENGTH_MISMATCH {
-            size = (ret_len as usize).max(size * 2) + 256 * 1024; // 句柄数在涨, 留余量
+            size = (ret_len as usize).max(size * 2) + 256 * 1024; // the handle count keeps growing, leave headroom
             continue;
         }
         if st < 0 {
@@ -828,8 +863,9 @@ enum QueryResult {
     TimedOut,
 }
 
-/// 复用型对象名查询器: 一个 worker 线程顺序处理 NtQueryObject(名字), 调用方带超时收结果。
-/// 超时 = 该句柄挂死, worker 作废, 调用方换新的 (旧 worker 成孤儿, 一次性操作可接受)。
+/// Reusable object-name querier: one worker thread runs NtQueryObject(name) requests in order, and the caller
+/// waits for each result with a timeout. A timeout means that handle hung: the worker is discarded and the
+/// caller creates a new one (the old worker is orphaned; acceptable for a one-off operation).
 struct NameQuerier {
     req: std::sync::mpsc::Sender<usize>,
     resp: std::sync::mpsc::Receiver<Option<String>>,
@@ -862,11 +898,11 @@ impl NameQuerier {
     }
 }
 
-/// 同步取对象名 (在 worker 线程里跑, 可能挂死)。
+/// Gets the object name synchronously (runs on the worker thread, may hang).
 fn query_name_sync(nt_qo: NtQueryObjectFn, handle_val: usize) -> Option<String> {
     use windows::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
     let h = HANDLE(handle_val as *mut c_void);
-    // 管道 / 控制台 / 字符设备不可能是要解锁的文件, 而且正是查名挂死的那批
+    // Pipes / consoles / character devices can't be files to unlock, and they're exactly the ones whose name query hangs
     if unsafe { GetFileType(h) } != FILE_TYPE_DISK {
         return None;
     }
@@ -880,7 +916,8 @@ fn query_name_sync(nt_qo: NtQueryObjectFn, handle_val: usize) -> Option<String> 
     if st < 0 { None } else { read_unicode_string(&buf) }
 }
 
-/// NtQueryObject 的 Name / Type 信息都以 UNICODE_STRING 打头, Buffer 指向同一分配的后半段。
+/// NtQueryObject's Name / Type info both start with a UNICODE_STRING whose Buffer points into the rest of the
+/// same allocation.
 fn read_unicode_string(buf: &[u8]) -> Option<String> {
     if buf.len() < std::mem::size_of::<UnicodeString>() {
         return None;
@@ -893,7 +930,8 @@ fn read_unicode_string(buf: &[u8]) -> Option<String> {
     Some(String::from_utf16_lossy(slice))
 }
 
-/// 去 `\\?\` / `\\?\UNC\` 前缀, 分隔符统一 `\`, 全小写 —— 跟 QueryFullProcessImageNameW 的结果可比。
+/// Strips the `\\?\` / `\\?\UNC\` prefix, uses `\` as the separator and lowercases everything, so it compares
+/// with QueryFullProcessImageNameW results.
 fn normalize_win32_path(p: &str) -> String {
     let s = p.replace('/', "\\");
     let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
@@ -906,8 +944,8 @@ fn normalize_win32_path(p: &str) -> String {
     s.to_lowercase()
 }
 
-/// DOS 路径 (`C:\Users\...`) → NT 设备路径 (`\Device\HarddiskVolume3\Users\...`)。
-/// 目标打不开时的退路, 只认盘符形态。
+/// DOS path (`C:\Users\...`) → NT device path (`\Device\HarddiskVolume3\Users\...`).
+/// Fallback for when the target can't be opened; drive-letter paths only.
 fn dos_to_nt_path(target: &Path) -> Option<String> {
     let mut s = target.to_string_lossy().replace('/', "\\");
     if let Some(rest) = s.strip_prefix(r"\\?\") {
@@ -938,35 +976,35 @@ mod tests {
         d
     }
 
-    /// 盘符路径要能转成 \Device\... 形态, 否则全系统扫描一条都对不上
+    /// Drive-letter paths must convert to the \Device\... form, or nothing in the system-wide scan would match
     #[test]
     fn drive_path_maps_to_device() {
         let sys = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-        let nt = dos_to_nt_path(Path::new(&sys)).expect("盘符路径应该能转");
+        let nt = dos_to_nt_path(Path::new(&sys)).expect("a drive-letter path should convert");
         assert!(nt.starts_with(r"\Device\"), "{nt}");
         assert!(nt.to_lowercase().ends_with(r"\windows"), "{nt}");
         assert!(dos_to_nt_path(Path::new(r"\\wsl.localhost\Ubuntu\home")).is_none());
         assert!(dos_to_nt_path(Path::new("relative\\path")).is_none());
     }
 
-    /// 文件夹命中要卡在分隔符上: c:\a 不能吃掉 c:\ab
+    /// Folder matches must stop at a separator: c:\a must not swallow c:\ab
     #[test]
     fn hit_respects_separator() {
         assert!(hit(r"c:\a", true, r"c:\a"));
         assert!(hit(r"c:\a", true, r"c:\a\b.txt"));
-        assert!(!hit(r"c:\a", true, r"c:\ab\b.txt"), "同前缀的兄弟目录不算");
-        assert!(!hit(r"c:\a.txt", false, r"c:\a.txt\x"), "文件目标不吃子路径");
+        assert!(!hit(r"c:\a", true, r"c:\ab\b.txt"), "a sibling folder sharing the prefix doesn't count");
+        assert!(!hit(r"c:\a.txt", false, r"c:\a.txt\x"), "a file target doesn't match sub-paths");
         assert_eq!(normalize_win32_path(r"\\?\UNC\srv\share\X"), r"\\srv\share\x");
         assert_eq!(normalize_win32_path(r"\\?\C:/Dir/A.TXT"), r"c:\dir\a.txt");
     }
 
-    /// 端到端: 子进程开着文件夹里的文件 → 扫得到, 而且记在那个文件夹 (target 0) 名下
+    /// End to end: a child process holds a file inside the folder → it's found, and recorded under that folder (target 0)
     #[test]
     fn finds_child_process_holding_file() {
         let dir = tmp("scan");
         let file = dir.join("held.txt");
         std::fs::write(&file, b"x").unwrap();
-        // powershell 以独占方式开着文件睡 30 秒
+        // powershell holds the file open exclusively and sleeps for 30 seconds
         let script = format!(
             "$f=[IO.File]::Open('{}','Open','ReadWrite','None'); Start-Sleep 30",
             file.display()
@@ -982,12 +1020,12 @@ mod tests {
             }
         }
         let mine: Vec<&Locker> = got.iter().filter(|l| l.pid == pid).collect();
-        assert!(mine.iter().any(|l| l.kind == LockKind::Handle && l.target == 0), "应扫到子进程的句柄: {got:?}");
-        // 解锁: 关掉句柄后文件就能删了, 进程还活着 (不是靠结束进程删的)
+        assert!(mine.iter().any(|l| l.kind == LockKind::Handle && l.target == 0), "the child's handle should be found: {got:?}");
+        // Unlock: after closing the handle the file can be deleted, and the process is still alive (it wasn't ended to get there)
         let h: Vec<Locker> = mine.into_iter().filter(|l| l.kind == LockKind::Handle).cloned().collect();
         assert!(release(&h) >= 1);
-        assert!(std::fs::remove_file(&file).is_ok(), "关句柄后应能删");
-        assert!(child.try_wait().unwrap().is_none(), "只关句柄, 进程还在");
+        assert!(std::fs::remove_file(&file).is_ok(), "should be deletable after closing the handle");
+        assert!(child.try_wait().unwrap().is_none(), "only the handle was closed, the process is still running");
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1004,11 +1042,12 @@ mod tests {
             kind: LockKind::Handle,
             nt_path: nt.into(),
         };
-        assert!(!close_handle(&l(0, 0, "x")), "handle 0 无句柄可关");
-        assert!(!close_handle(&l(0x4, 1, r"\device\x")), "创建时间对不上 = PID 已重用, 必须拒绝");
+        assert!(!close_handle(&l(0, 0, "x")), "handle 0 means nothing to close");
+        assert!(!close_handle(&l(0x4, 1, r"\device\x")), "mismatched creation time = reused PID, must refuse");
     }
 
-    /// 闸 2/3: 自己开个文件拿真句柄, 路径对不上要拒绝、对得上才真关 (盯着漏关和误关两个方向)
+    /// Checks 2/3: open a file ourselves for a real handle; refuse on a path mismatch, close only on a match
+    /// (covers both failing to close and closing the wrong one)
     #[test]
     fn close_handle_checks_path_identity() {
         use std::os::windows::io::AsRawHandle;
@@ -1027,9 +1066,9 @@ mod tests {
             kind: LockKind::Handle,
             nt_path,
         };
-        assert!(!close_handle(&l(format!("{nt}.other"))), "nt_path 对不上必须拒绝");
-        assert!(close_handle(&l(nt)), "路径一致时应真关掉");
-        std::mem::forget(f); // 句柄已被强关, 别让 Drop 再关一次
+        assert!(!close_handle(&l(format!("{nt}.other"))), "mismatched nt_path must be refused");
+        assert!(close_handle(&l(nt)), "should close it when the path matches");
+        std::mem::forget(f); // the handle was force-closed, don't let Drop close it again
         let _ = std::fs::remove_dir_all(&dir);
     }
 

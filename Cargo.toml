@@ -2,13 +2,13 @@
 name = "obunlock"
 version = "0.1.0"
 edition = "2024"
-description = "文件解锁引擎 (谁锁着文件 / 关句柄 / 结束进程 / 强删 / 重启后删除), obcmd、hotkit、obcleaner 共用"
+description = "Windows file-unlocking engine: find who locks a file, close handles / end processes, force delete, delete on reboot"
 license = "MIT"
 publish = false
 
 [dependencies]
 log = "0.4"
-# 跟 obcmd / hotkit 锁同一版本, 免得编两份 windows
+# Pinned to the same version as the host apps, so windows isn't compiled twice
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Security",
