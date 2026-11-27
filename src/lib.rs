@@ -1,15 +1,19 @@
-//! 文件解锁引擎 (IObit Unlocker 同类), obcmd 与 hotkit 共用。只有引擎, 没有界面 ——
-//! 弹窗 / 确认 / 提示由各自程序做。日志走 `log` 门面, 宿主不装 logger 就不出。
+//! File-unlocking engine (in the vein of IObit Unlocker), shared by ObCommander, HotKit and ObCleaner.
+//! Engine only, no UI: dialogs, confirmations and messages belong to the host app. Logging goes
+//! through the `log` facade and prints nothing unless the host installs a logger.
 //!
-//! - [`find_lockers`]: 谁锁着这些文件 / 文件夹 (四路并行检测, 见 `scan.rs`)
-//! - [`release`] / [`close_handle`] / [`terminate`]: 解锁 —— 关句柄, 关不了的结束进程
-//! - [`force_delete`] / [`schedule_reboot_delete`]: 强删, 还删不掉就登记重启后删除
+//! - [`find_lockers`]: who is locking these files / folders (four scans in parallel, see `scan.rs`)
+//! - [`release`] / [`close_handle`] / [`terminate`]: unlock: close the handle, or end the process if there is none
+//! - [`force_delete`] / [`schedule_reboot_delete`]: force delete, and if that still fails, delete on reboot
 //!
-//! 安全底线 (两边合并时取严的那一边):
-//! - 关句柄前三道闸: 进程创建时间 → 句柄现在指向的路径 → 才真关 (防 PID / 句柄值重用误伤)
-//! - 结束进程前在同一个进程句柄上核对创建时间; 认不出是谁就不杀
-//! - 系统关键进程 (System / csrss / lsass / 带 BreakOnTermination 的) 只展示不动手, 动了就蓝屏
-//! - 盘根 / Windows / Program Files / 用户目录这些目录本身不让整个删
+//! Safety rules:
+//! - Three checks before closing a handle: process creation time → the path the handle points to now →
+//!   only then close it (guards against PID / handle-value reuse)
+//! - Before ending a process, its creation time is checked on the same process handle; a process that
+//!   can't be identified is not ended
+//! - System-critical processes (System / csrss / lsass / anything with BreakOnTermination) are shown but
+//!   never touched: touching them means a blue screen
+//! - Drive roots / Windows / Program Files / the user profile folder itself can't be deleted as a whole
 
 mod delete;
 mod process;

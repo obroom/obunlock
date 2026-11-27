@@ -1,4 +1,4 @@
-//! 进程小工具: 名字 / 路径 / 创建时间 / 是不是系统关键进程 / 开 SeDebugPrivilege。
+//! Process helpers: name / path / creation time / is it system-critical / enable SeDebugPrivilege.
 
 use std::path::Path;
 
@@ -9,19 +9,21 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{PCWSTR, PWSTR, s, w};
 
-/// 不许结束的普通进程: explorer 常年因缩略图缓存锁着文件, 批量结束会把桌面 / 任务栏一起带走。
-/// 系统关键进程另由 [`is_critical_process`] 拦。
+/// Ordinary processes that must not be ended: explorer often holds files open for its thumbnail cache,
+/// and ending it in bulk takes the desktop and taskbar down with it.
+/// System-critical processes are blocked separately by [`is_critical_process`].
 pub const KILL_PROTECTED: &[&str] = &["explorer.exe"];
 
-/// 系统关键进程名 (小写)。结束它们 Windows 立即蓝屏 (CRITICAL_PROCESS_DIED)。
+/// System-critical process names (lowercase). Ending any of them blue-screens Windows (CRITICAL_PROCESS_DIED).
 const CRITICAL_NAMES: &[&str] = &[
     "system", "registry", "memory compression", "secure system", "smss.exe", "csrss.exe",
     "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "lsaiso.exe",
 ];
 
-/// 系统关键进程: 不关它的句柄、不结束它, 这类占用只能重启后删除。
-/// PID ≤ 4 / 关键进程名单 / 带 ProcessBreakOnTermination 标记 → 是;
-/// 标记查不到时按名字认, 名字也认不出 → 当它是 (宁可不动)。
+/// System-critical process: never close its handles or end it; such locks can only be cleared by
+/// deleting on reboot. PID ≤ 4 / on the critical-name list / has the ProcessBreakOnTermination flag → yes.
+/// If the flag can't be read, decide by name; if the name can't be read either, treat it as critical
+/// (better to leave it alone).
 pub fn is_critical_process(pid: u32) -> bool {
     type NtQipFn = unsafe extern "system" fn(HANDLE, u32, *mut std::ffi::c_void, u32, *mut u32) -> i32;
     const PROCESS_BREAK_ON_TERMINATION: u32 = 29;
@@ -79,7 +81,7 @@ pub fn enable_se_debug_privilege() {
     }
 }
 
-/// 进程 exe 完整路径 (受限查询权限就够, 未提权也能查大多数进程)。
+/// Full path of the process exe (limited query access is enough, so most processes work without elevation).
 pub fn process_image_path(pid: u32) -> Option<String> {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
@@ -102,7 +104,7 @@ pub fn process_basename(pid: u32) -> Option<String> {
     Path::new(&full).file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
-/// 进程创建时间 (FILETIME 64 位)。动手前重查比对, 防 PID 重用误伤。
+/// Process creation time (64-bit FILETIME). Re-checked before acting, so a reused PID isn't hit by mistake.
 pub fn process_start_time(pid: u32) -> Option<u64> {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
@@ -127,9 +129,9 @@ mod tests {
     #[test]
     fn system_pids_are_critical() {
         assert!(is_critical_process(0));
-        assert!(is_critical_process(4), "System 动了就蓝屏");
+        assert!(is_critical_process(4), "touching System means a blue screen");
         let me = std::process::id();
-        assert!(!is_critical_process(me), "自己 (普通进程) 不是关键进程");
+        assert!(!is_critical_process(me), "this (ordinary) process is not critical");
     }
 
     #[test]
