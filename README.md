@@ -5,7 +5,7 @@
 A Windows file-unlocking engine in Rust: find out who is locking a file or folder, release it
 (close the handle or end the process), force-delete it, or schedule it for deletion on reboot.
 
-It powers the unlock feature in [ObCommander](https://obcommander.com), [HotKit](https://hotkit.app) and
+It powers the unlock feature in [HotKit](https://hotkit.app), [ObCommander](https://obcommander.com) and
 [ObCleaner](https://github.com/obroom/obcleaner).
 The crate is engine only — no UI. Confirmations and prompts belong to the host app.
 

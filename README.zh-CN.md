@@ -5,7 +5,7 @@
 Windows 文件解锁引擎（Rust）：查出谁锁着文件或文件夹，解锁（关句柄或结束进程），强制删除，
 或者登记重启后删除。
 
-[ObCommander](https://obcommander.com)、[HotKit](https://hotkit.app) 和
+[HotKit](https://hotkit.app)、[ObCommander](https://obcommander.com) 和
 [ObCleaner](https://github.com/obroom/obcleaner) 的解锁功能都用的是它。
 这个 crate 只有引擎，没有界面，弹窗、确认、提示由宿主程序自己做。
 
